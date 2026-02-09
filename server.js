@@ -3,17 +3,15 @@ const axios = require('axios');
 
 const app = express();
 
-// === Bulletproof CORS configuration ===
+// === Bulletproof CORS (fixes preflight / OPTIONS) ===
 app.use((req, res, next) => {
-  // Allow Zendesk domain (or * for testing)
-  res.setHeader('Access-Control-Allow-Origin', '*'); // change to 'https://iot-x.zendesk.com' in production
-
+  res.setHeader('Access-Control-Allow-Origin', '*'); // '*' for testing; later change to 'https://iot-x.zendesk.com'
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // Handle browser preflight (OPTIONS) request
+  // Handle preflight request (browser always sends OPTIONS first)
   if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Max-Age', '86400'); // cache for 24 hours
+    res.setHeader('Access-Control-Max-Age', '86400');
     return res.status(204).end();
   }
 
@@ -22,14 +20,20 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// === Configuration ===
+// === Zendesk Configuration ===
 const ZENDESK_SUBDOMAIN = 'con-acmesolution';
 const ZENDESK_ADMIN_EMAIL = 'gungun.aswani@iot-x.io';
-const ZENDESK_TOKEN = process.env.ZENDESK_TOKEN; // must be set in Vercel env variables!
+const ZENDESK_TOKEN = process.env.ZENDESK_TOKEN;
 
+// === Debug: Check token at startup ===
 if (!ZENDESK_TOKEN) {
-  console.error('CRITICAL: ZENDESK_TOKEN environment variable is not set!');
+  console.error('FATAL ERROR: ZENDESK_TOKEN environment variable is NOT set in Vercel!');
+  console.error('Go to Vercel → Settings → Environment Variables → Add ZENDESK_TOKEN');
+} else {
+  console.log('ZENDESK_TOKEN loaded successfully (length: ' + ZENDESK_TOKEN.length + ' characters)');
 }
+console.log('Using Zendesk subdomain:', ZENDESK_SUBDOMAIN);
+console.log('Admin email:', ZENDESK_ADMIN_EMAIL);
 
 // Custom field IDs
 const RATING_FIELD_ID = 33041185023122;
@@ -72,18 +76,16 @@ function getRatingText(rating) {
 app.post('/submit-survey', async (req, res) => {
   const { ticketId, rating, positive, improvement, userEmail } = req.body;
 
-  // Basic input validation
+  // Basic validation
   if (!ticketId || !rating) {
-    return res.status(400).json({
-      success: false,
-      message: 'Missing required fields: ticketId and rating'
-    });
+    console.log('Validation failed: missing ticketId or rating');
+    return res.status(400).json({ success: false, message: 'Missing ticketId or rating' });
   }
 
-  try {
-    console.log(`Received survey for ticket #${ticketId} - Rating: ${rating}`);
+  console.log(`Received survey data for ticket #${ticketId} | Rating: ${rating} | Email: ${userEmail || 'anonymous'}`);
 
-    // 1. Update ticket
+  try {
+    // 1. Update Ticket
     const ratingTag = getRatingTag(rating);
     const satisfactionTags = getSatisfactionTags(rating);
     const commentBody = `Customer Feedback Survey:\n` +
@@ -91,7 +93,9 @@ app.post('/submit-survey', async (req, res) => {
                         `What went well: ${positive || '—'}\n` +
                         `What can we improve: ${improvement}`;
 
-    await axios.put(
+    console.log('Attempting to update ticket...');
+
+    const ticketResponse = await axios.put(
       `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticketId}.json`,
       {
         ticket: {
@@ -101,10 +105,7 @@ app.post('/submit-survey', async (req, res) => {
             { id: IMPROVEMENT_FIELD_ID, value: improvement }
           ],
           tags: satisfactionTags,
-          comment: {
-            body: commentBody,
-            public: false // internal comment
-          }
+          comment: { body: commentBody, public: false }
         }
       },
       {
@@ -116,16 +117,16 @@ app.post('/submit-survey', async (req, res) => {
       }
     );
 
-    console.log('Ticket updated successfully');
+    console.log('Ticket updated successfully:', ticketResponse.status);
 
-    // 2. Create custom event
+    // 2. Create Custom Event
+    console.log('Creating custom event...');
+
     const eventPayload = {
       profile: {
         source: 'help_center_survey',
         type: 'customer',
-        identifiers: [
-          { type: 'email', value: userEmail || 'anonymous@example.com' }
-        ]
+        identifiers: [{ type: 'email', value: userEmail || 'anonymous@example.com' }]
       },
       event: {
         source: 'help_center_survey',
@@ -141,7 +142,7 @@ app.post('/submit-survey', async (req, res) => {
       }
     };
 
-    await axios.post(
+    const eventResponse = await axios.post(
       `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/user_profiles/events`,
       eventPayload,
       {
@@ -153,19 +154,27 @@ app.post('/submit-survey', async (req, res) => {
       }
     );
 
-    console.log('Custom event created successfully');
+    console.log('Custom event created successfully:', eventResponse.status);
 
-    // Success response
+    // Final success
     res.json({ success: true, message: 'Survey submitted and tracked successfully' });
   } catch (error) {
-    console.error('Error processing survey:', error.message);
+    console.error('Error in /submit-survey:', error.message);
+
     if (error.response) {
-      console.error('Zendesk API error:', error.response.data);
+      console.error('Zendesk API failed with status:', error.response.status);
+      console.error('Zendesk error details:', error.response.data);
+    } else if (error.request) {
+      console.error('No response from Zendesk. Request details:', error.request);
+    } else {
+      console.error('Unexpected error:', error.message);
     }
+
     res.status(500).json({
       success: false,
       message: 'Failed to submit survey',
-      error: error.message
+      error: error.message,
+      zendeskStatus: error.response?.status || 'unknown'
     });
   }
 });
